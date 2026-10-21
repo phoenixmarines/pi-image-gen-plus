@@ -1,0 +1,42 @@
+{
+  "name": "pi-image-gen-plus",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Provider-agnostic image generation for Pi coding agent (fork of @ssweens/pi-image-gen: current pi-tui keybindings, fixed OpenRouter discovery, image cost tracking)",
+  "author": "JacksGameCave <jackdolansmith@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phoenixmarines/pi-image-gen-plus.git"
+  },
+  "homepage": "https://github.com/phoenixmarines/pi-image-gen-plus#readme",
+  "bugs": {
+    "url": "https://github.com/phoenixmarines/pi-image-gen-plus/issues"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions/",
+    "lib/",
+    "scripts/",
+    "README.md",
+    "LICENSE",
+    "screenshot.png"
+  ],
+  "scripts": {
+    "generate-models": "npx tsx scripts/generate-image-models.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
