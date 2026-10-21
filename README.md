@@ -2,7 +2,7 @@
 
 ![pi-image-gen model selector](screenshot.png)
 
-> **Author:** JacksGameCave ([@phoenixmarines](https://github.com/phoenixmarines))
+> **Author:** PhoenixMarine ([@phoenixmarines](https://github.com/phoenixmarines))
 >
 > Personal fork of [`@ssweens/pi-image-gen`](https://www.npmjs.com/package/@ssweens/pi-image-gen) (MIT, © ssweens) with the fixes and features below.
 
