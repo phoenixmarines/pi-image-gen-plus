@@ -975,6 +975,9 @@ const TOOL_PARAMS = Type.Object({
   inputImage: Type.Optional(Type.String({
     description: "Path to an existing image file to edit. When set, the edit model (from /image-edit-model) is used; it must accept input images.",
   })),
+  inputImages: Type.Optional(Type.Array(Type.String(), {
+    description: "Paths to multiple existing image files to use together as references (OpenRouter accepts up to 16). Merged with inputImage.",
+  })),
   aspectRatio: Type.Optional(Type.String({
     description: "Aspect ratio: 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.",
   })),
@@ -1386,7 +1389,13 @@ export default function piImageGen(pi: ExtensionAPI) {
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
       const config = loadConfig(ctx.cwd);
-      const inputImages = params.inputImage ? [loadInputImageDataUrl(params.inputImage, ctx.cwd)] : undefined;
+      const inputPaths = [
+        ...(params.inputImage ? [params.inputImage] : []),
+        ...(params.inputImages ?? []),
+      ];
+      const inputImages = inputPaths.length > 0
+        ? inputPaths.map((p) => loadInputImageDataUrl(p, ctx.cwd))
+        : undefined;
       const generationModel = resolveModel(sessionSelection, config);
       const imageModel = inputImages
         ? resolveEditModel(editModelSelection, config, generationModel)
@@ -1426,7 +1435,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       }
 
       const summary: string[] = [
-        inputImages ? `Edited image using ${params.inputImage}.` : `Generated image.`,
+        inputPaths.length > 0 ? `Edited image using ${inputPaths.join(", ")}.` : `Generated image.`,
         `Aspect ratio: ${aspectRatio}.`,
       ];
       if (savedPath) summary.push(`Saved to: ${savedPath}`);
@@ -1443,6 +1452,7 @@ export default function piImageGen(pi: ExtensionAPI) {
           model: imageModel.id,
           api: imageModel.api,
           inputImage: params.inputImage,
+          inputPaths: inputPaths.length > 0 ? inputPaths : undefined,
           aspectRatio,
           quality,
           savedPath,
