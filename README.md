@@ -11,6 +11,7 @@
 - **Fix — `/image-model` crash on current pi / pi-tui:** upstream calls the nonexistent `getEditorKeybindings()`. The picker now uses the `KeybindingsManager` pi passes to `ctx.ui.custom()` and the current `tui.select.*` keybinding IDs.
 - **Fix — OpenRouter model discovery:** upstream's `api/frontend/models` endpoint now 404s, and its plain `/v1/models` fallback omits image-only models (e.g. `meta/muse-image`). Discovery now uses `/v1/models?output_modalities=image`, which returns all image-output models. (Also fixed in the build-time generator script.)
 - **Feature — image generation cost tracking:** every generation is recorded as a session `usage` entry (`kind: "image_gen"`), so image spend shows up in the footer `$` total, as its own per-model line in `/session` → Cost, and as a cumulative `images: $x.xxx` chip on the footer status line (seeded from the session file, so it survives restarts). Actual billed cost is taken from OpenRouter's `usage.cost` when reported, falling back to the per-image registry price.
+- **Feature — image editing with an input image:** pass `inputImage` (a local file path) to the `generate_image` tool to edit/reference an existing image instead of generating from scratch. OpenRouter models are routed through the unified Image API (`input_references`), OpenAI direct models through `/images/edits`, and Google models through inline `inlineData` parts. Edit-capability is discovered live from OpenRouter's `/api/v1/images/models`, and `/image-edit-model` picks the default edit model with the same interactive picker as `/image-model` (persisted as `defaultEditProvider`/`defaultEditModel`).
 
 ## Install
 
@@ -30,6 +31,7 @@ Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a
 - 🖼️ **Aspect ratios & quality** — 1:1, 16:9, 9:16, 4:3, etc. with quality controls
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
 - 🎯 **`/image-model` command** — Interactive fuzzy-search model picker with session persistence
+- ✂️ **Image editing** — `generate_image` with `inputImage` edits an existing image; pick the edit model via `/image-edit-model`
 
 Uninstall the upstream package first if you have it installed — both register the same `generate_image` tool and `/image-model` command:
 
@@ -60,6 +62,24 @@ Use `/image-model` — works in both Pi terminal and Minapi:
 ```
 
 Selection persists in the session and shows in the status bar as `🎨 provider/model`.
+
+### Editing an Existing Image
+
+Pass `inputImage` to the `generate_image` tool — the model must accept input images (image-to-image). If no edit model is configured yet, the extension falls back to the current generation model when it supports editing, then advises which models do:
+
+```
+> Edit this photo to look like a watercolor painting (inputImage: photo.png)
+```
+
+Choose the default edit model the same way as the generation model:
+
+```
+/image-edit-model                                  # Interactive picker (edit-capable models only)
+/image-edit-model openai/gpt-image-1               # Direct selection
+/image-edit-model google/gemini-3.1-flash-image    # OpenRouter model
+```
+
+Edit-capability for OpenRouter models is discovered from `/api/v1/images/models` (the `input_references` parameter), so the picker always reflects what each model actually accepts. Selection persists as `defaultEditProvider`/`defaultEditModel` in `~/.pi/agent/settings/pi-image-gen.json`.
 
 ## Built-in Providers & Models
 

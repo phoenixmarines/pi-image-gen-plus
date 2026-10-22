@@ -1,6 +1,6 @@
 {
   "name": "pi-image-gen-plus",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "Provider-agnostic image generation for Pi coding agent (fork of @ssweens/pi-image-gen: current pi-tui keybindings, fixed OpenRouter discovery, image cost tracking)",
   "author": "PhoenixMarine",

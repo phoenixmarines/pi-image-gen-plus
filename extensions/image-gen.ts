@@ -17,7 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { extname, isAbsolute, join } from "node:path";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
@@ -69,6 +69,9 @@ interface ExtensionConfig {
   saveDir?: string;
   defaultProvider?: string;
   defaultModel?: string;
+  /** Default model for image editing (accepts an input image), via /image-edit-model. */
+  defaultEditProvider?: string;
+  defaultEditModel?: string;
   /** Image generation timeout in seconds. Default: 600 (10 min). */
   timeout?: number;
   /** Image provider definitions. Each key is a provider name; value defines
@@ -101,6 +104,16 @@ async function saveDefaultModel(provider: string, modelId: string): Promise<void
   const existing = readJsonFile(path);
   existing.defaultProvider = provider;
   existing.defaultModel = modelId;
+  await mkdir(join(getAgentDir(), "settings"), { recursive: true });
+  await writeFile(path, JSON.stringify(existing, null, 2));
+}
+
+/** Persist edit-model selection to global config so it survives across sessions. */
+async function saveDefaultEditModel(provider: string, modelId: string): Promise<void> {
+  const path = globalConfigPath();
+  const existing = readJsonFile(path);
+  existing.defaultEditProvider = provider;
+  existing.defaultEditModel = modelId;
   await mkdir(join(getAgentDir(), "settings"), { recursive: true });
   await writeFile(path, JSON.stringify(existing, null, 2));
 }
@@ -239,7 +252,12 @@ const DISCOVERY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 interface DiscoveryCache {
   fetchedAt: number;
   models: ImageModel[];
+  /** OpenRouter image-model edit capability: id → accepts input references. */
+  inputRefs?: Record<string, boolean>;
 }
+
+/** In-memory edit-capability map (OpenRouter image model id → accepts input images). */
+const inputRefSupport = new Map<string, boolean>();
 
 /** Read cached discovered models if cache is fresh */
 function readDiscoveryCache(): ImageModel[] {
@@ -251,6 +269,9 @@ function readDiscoveryCache(): ImageModel[] {
     if (ageMs > DISCOVERY_TTL_MS) return []; // Stale
 
     const cache = JSON.parse(readFileSync(cacheFile, "utf-8")) as DiscoveryCache;
+    if (cache.inputRefs) {
+      for (const [id, supports] of Object.entries(cache.inputRefs)) inputRefSupport.set(id, supports);
+    }
     return cache.models;
   } catch {
     return [];
@@ -267,12 +288,14 @@ let discoveredModels: ImageModel[] = readDiscoveryCache();
  * omits. (The old frontend API /api/frontend/models now returns 404.)
  */
 async function refreshDiscoveryCache(): Promise<void> {
-  // Skip if cache is still fresh
+  // Skip if cache is still fresh AND carries the edit-capability map
+  // (caches written by older versions lack inputRefs — refetch once to fill it)
   const cacheFile = discoveryCacheFile();
   if (existsSync(cacheFile)) {
     try {
       const stat = statSync(cacheFile);
-      if (Date.now() - stat.mtimeMs < DISCOVERY_TTL_MS) return;
+      const cached = JSON.parse(readFileSync(cacheFile, "utf-8")) as DiscoveryCache;
+      if (Date.now() - stat.mtimeMs < DISCOVERY_TTL_MS && cached.inputRefs) return;
     } catch {
       // Continue to fetch
     }
@@ -309,13 +332,35 @@ async function refreshDiscoveryCache(): Promise<void> {
       });
     }
 
+    // Capability map: which OpenRouter image models accept input references
+    // (needed for image editing). Best-effort — edits just won't be offered
+    // for unknown models if this fails.
+    let inputRefs: Record<string, boolean> | undefined;
+    try {
+      const capsResponse = await fetch("https://openrouter.ai/api/v1/images/models");
+      if (capsResponse.ok) {
+        const caps = (await capsResponse.json()) as {
+          data?: Array<{ id: string; supported_parameters?: Record<string, unknown> }>;
+        };
+        inputRefs = {};
+        for (const m of caps.data ?? []) {
+          inputRefs[m.id] = "input_references" in (m.supported_parameters ?? {});
+        }
+      }
+    } catch {
+      // Capability discovery is best-effort
+    }
+
     // Write cache
     await mkdir(discoveryCacheDir(), { recursive: true });
-    const cache: DiscoveryCache = { fetchedAt: Date.now(), models };
+    const cache: DiscoveryCache = { fetchedAt: Date.now(), models, ...(inputRefs ? { inputRefs } : {}) };
     await writeFile(discoveryCacheFile(), JSON.stringify(cache, null, 2));
 
     // Update in-memory
     discoveredModels = models;
+    if (inputRefs) {
+      for (const [id, supports] of Object.entries(inputRefs)) inputRefSupport.set(id, supports);
+    }
   } catch {
     // Silent failure — we still have built-in + models.json
   }
@@ -371,6 +416,40 @@ function getAllModels(config: ExtensionConfig): ImageModel[] {
   }
 
   return [...models.values()];
+}
+
+// ── Edit (input image) Support ─────────────────────────────────────
+
+/** Parse a data URL into mime type + raw bytes. */
+function parseDataUrl(dataUrl: string): { mimeType: string; buffer: Buffer } {
+  const match = dataUrl.match(/^data:([^;,]+)(;base64)?,(.*)$/s);
+  if (!match) throw new Error("Invalid data URL for input image.");
+  return { mimeType: match[1] || "image/png", buffer: Buffer.from(match[3] || "", match[2] ? "base64" : "utf-8") };
+}
+
+/** Whether a model accepts an input/reference image (image editing). */
+function modelSupportsInputReferences(model: ImageModel): boolean {
+  if (model.provider === "openrouter") {
+    // Capabilities discovered from GET /api/v1/images/models
+    return inputRefSupport.get(model.id) === true;
+  }
+  if (model.provider === "openai") return model.id.startsWith("gpt-image");
+  if (model.provider === "google") return model.id.includes("-image") && !model.id.includes("imagen");
+  return false;
+}
+
+/** All models that accept an input image (for /image-edit-model + edit routing). */
+function listInputImageModels(config: ExtensionConfig): ImageModel[] {
+  return getAllModels(config).filter(modelSupportsInputReferences);
+}
+
+/** Read a local image file as a base64 data URL for input_references/inlineData. */
+function loadInputImageDataUrl(inputPath: string, cwd: string): string {
+  const path = isAbsolute(inputPath) ? inputPath : join(cwd, inputPath);
+  if (!existsSync(path)) throw new Error(`Input image not found: ${path}`);
+  const ext = extname(path).toLowerCase();
+  const mimeType = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : ext === ".gif" ? "image/gif" : "image/png";
+  return `data:${mimeType};base64,${readFileSync(path).toString("base64")}`;
 }
 
 // ── Save Logic ─────────────────────────────────────────────────────
@@ -534,6 +613,47 @@ async function generateViaOpenAIImages(
   return { data: result.data[0].b64_json, mimeType: "image/png", billedCost: model.cost > 0 ? model.cost : undefined };
 }
 
+/** OpenAI /v1/images/edits (multipart) — edits existing images from a prompt. */
+async function generateViaOpenAIEdits(
+  config: ProviderConfig,
+  model: ImageModel,
+  prompt: string,
+  aspectRatio: string,
+  quality: string,
+  inputImages: string[],
+  signal?: AbortSignal,
+): Promise<GeneratedImage> {
+  const size = OPENAI_SIZES[aspectRatio] || "1024x1024";
+  const form = new FormData();
+  form.append("model", model.id);
+  form.append("prompt", prompt);
+  form.append("n", "1");
+  form.append("size", size);
+  if (model.id === "gpt-image-1") form.append("quality", quality);
+  for (const [i, dataUrl] of inputImages.entries()) {
+    const { mimeType, buffer } = parseDataUrl(dataUrl);
+    const ext = mimeType.includes("jpeg") ? "jpg" : mimeType.includes("webp") ? "webp" : "png";
+    form.append("image[]", new Blob([new Uint8Array(buffer)], { type: mimeType }), `input-${i}.${ext}`);
+  }
+
+  const response = await fetch(`${config.baseUrl}/images/edits`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${config.apiKey}` },
+    body: form,
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`OpenAI image edit failed (${response.status}): ${errorText}`);
+  }
+
+  const result = (await response.json()) as { data: Array<{ b64_json?: string }> };
+  if (!result.data[0]?.b64_json) throw new Error("OpenAI returned no image data for edit");
+
+  return { data: result.data[0].b64_json, mimeType: "image/png", billedCost: model.cost > 0 ? model.cost : undefined };
+}
+
 /** OpenRouter chat completions with image output.
  *
  * Uses `modalities: ["image"]` so image-only endpoints can route successfully.
@@ -638,10 +758,14 @@ async function generateViaUnifiedImage(
   aspectRatio: string,
   imageSize: string,
   signal?: AbortSignal,
+  inputImages?: string[],
 ): Promise<GeneratedImage> {
   const body: Record<string, unknown> = { model: model.id, prompt };
   if (aspectRatio && aspectRatio !== "1:1") body.aspect_ratio = aspectRatio;
   if (imageSize && imageSize !== "1K") body.resolution = imageSize;
+  if (inputImages && inputImages.length > 0) {
+    body.input_references = inputImages.map((url) => ({ type: "image_url", image_url: { url } }));
+  }
 
   const response = await fetch(`${config.baseUrl}/images`, {
     method: "POST",
@@ -682,14 +806,20 @@ async function generateViaGoogleImage(
   model: ImageModel,
   prompt: string,
   signal?: AbortSignal,
+  inputImages?: string[],
 ): Promise<GeneratedImage> {
+  const requestParts: Array<Record<string, unknown>> = [{ text: prompt }];
+  for (const dataUrl of inputImages ?? []) {
+    const { mimeType, buffer } = parseDataUrl(dataUrl);
+    requestParts.push({ inlineData: { mimeType, data: buffer.toString("base64") } });
+  }
   const response = await fetch(
     `${config.baseUrl}/models/${model.id}:generateContent?key=${config.apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        contents: [{ role: "user", parts: requestParts }],
         generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
       }),
       signal,
@@ -726,7 +856,27 @@ async function generateImage(
   imageSize: string,
   quality: string,
   signal?: AbortSignal,
+  inputImages?: string[],
 ): Promise<GeneratedImage> {
+  // Editing path: route by provider to an endpoint that accepts input images
+  if (inputImages && inputImages.length > 0) {
+    switch (model.provider) {
+      case "openrouter":
+        // Unified Image API (input_references); works for models that reject
+        // chat/completions too (e.g. meta/muse-image)
+        return generateViaUnifiedImage(config, model, prompt, aspectRatio, imageSize, signal, inputImages);
+      case "openai":
+        return generateViaOpenAIEdits(config, model, prompt, aspectRatio, quality, inputImages, signal);
+      case "google":
+        return generateViaGoogleImage(config, model, prompt, signal, inputImages);
+      default:
+        throw new Error(
+          `Image editing is not supported for provider "${model.provider}". ` +
+          `Pick an edit model with /image-edit-model.`,
+        );
+    }
+  }
+
   switch (model.api) {
     case "openai-images":
       return generateViaOpenAIImages(config, model, prompt, aspectRatio, quality, signal);
@@ -780,14 +930,51 @@ function resolveModel(
   throw new Error("No image models available. Run /image-model to select one.");
 }
 
+/** Resolve the model used when an input image is provided (edit mode).
+ *  Falls back through: session edit selection → config edit defaults →
+ *  the current generation model (if it accepts input images) →
+ *  the first known edit-capable model. Throws with advice when none exist. */
+function resolveEditModel(
+  editSelection: ModelSelection | null,
+  config: ExtensionConfig,
+  generationModel: ImageModel,
+): ImageModel {
+  const allModels = getAllModels(config);
+
+  if (editSelection) {
+    const found = allModels.find(
+      (m) => m.provider === editSelection.provider && m.id === editSelection.model,
+    );
+    if (found && modelSupportsInputReferences(found)) return found;
+  }
+  if (config.defaultEditModel) {
+    const found = allModels.find((m) => m.id === config.defaultEditModel);
+    if (found && modelSupportsInputReferences(found)) return found;
+  }
+  if (modelSupportsInputReferences(generationModel)) return generationModel;
+
+  const candidates = listInputImageModels(config);
+  if (candidates.length > 0) return candidates[0];
+
+  throw new Error(
+    "No image model that accepts an input image is available, so this image can't be edited. " +
+    "Run /image-edit-model to see and select edit-capable models " +
+    "(e.g. openai/gpt-image-1, openai/gpt-image-2, google/gemini-3.1-flash-image via OpenRouter).",
+  );
+}
+
 // ── Session State ──────────────────────────────────────────────────
 
 const SESSION_ENTRY_TYPE = "pi-image-gen:model-select";
+const SESSION_ENTRY_EDIT_TYPE = "pi-image-gen:edit-model-select";
 
 // ── Tool Parameters ────────────────────────────────────────────────
 
 const TOOL_PARAMS = Type.Object({
-  prompt: Type.String({ description: "Description of the image to generate." }),
+  prompt: Type.String({ description: "Description of the image to generate (or the edit to apply when inputImage is set)." }),
+  inputImage: Type.Optional(Type.String({
+    description: "Path to an existing image file to edit. When set, the edit model (from /image-edit-model) is used; it must accept input images.",
+  })),
   aspectRatio: Type.Optional(Type.String({
     description: "Aspect ratio: 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.",
   })),
@@ -812,8 +999,133 @@ type ToolParams = Static<typeof TOOL_PARAMS>;
 
 // ── Extension Entry Point ──────────────────────────────────────────
 
+/** Interactive fuzzy-search model picker shared by /image-model and
+ *  /image-edit-model (mirrors Pi's /model UI). */
+async function pickModelWithUI(
+  ctx: ExtensionContext,
+  models: ImageModel[],
+  currentKey: string | null,
+  title: string,
+): Promise<ImageModel | undefined> {
+  // Sort: current model first, then alphabetically by provider
+  const sortedModels = [...models].sort((a, b) => {
+    const aIsCurrent = `${a.provider}/${a.id}` === currentKey;
+    const bIsCurrent = `${b.provider}/${b.id}` === currentKey;
+    if (aIsCurrent && !bIsCurrent) return -1;
+    if (!aIsCurrent && bIsCurrent) return 1;
+    return a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
+  });
+
+  return ctx.ui.custom<ImageModel | undefined>((tui, theme, kb, done) => {
+    const searchInput = new Input();
+    searchInput.focused = true;
+    const listContainer = new Container();
+    const previewText = new Text("", 1, 0);
+    let filteredModels = sortedModels;
+    let selectedIndex = 0;
+
+    // Thin border that spans viewport width, matching Pi's DynamicBorder
+    const border = { render: (w: number) => [theme.fg("border", "─".repeat(Math.max(1, w)))], invalidate() {} };
+
+    function updateList() {
+      listContainer.clear();
+      const maxVisible = 10;
+      const startIndex = Math.max(
+        0,
+        Math.min(selectedIndex - Math.floor(maxVisible / 2), filteredModels.length - maxVisible),
+      );
+      const endIndex = Math.min(startIndex + maxVisible, filteredModels.length);
+
+      for (let i = startIndex; i < endIndex; i++) {
+        const item = filteredModels[i];
+        if (!item) continue;
+        const isHighlighted = i === selectedIndex;
+        const isCurrent = `${item.provider}/${item.id}` === currentKey;
+        const providerBadge = theme.fg("muted", ` [${item.provider}]`);
+        const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
+
+        const line = isHighlighted
+          ? `${theme.fg("accent", "→ ")}${theme.fg("accent", item.id)}${providerBadge}${checkmark}`
+          : `  ${item.id}${providerBadge}${checkmark}`;
+        listContainer.addChild(new Text(line, 0, 0));
+      }
+
+      if (filteredModels.length > maxVisible) {
+        listContainer.addChild(
+          new Text(theme.fg("muted", `  (${selectedIndex + 1}/${filteredModels.length})`), 0, 0),
+        );
+      }
+
+      if (filteredModels.length === 0) {
+        listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
+      }
+    }
+
+    function updatePreview() {
+      const model = filteredModels[selectedIndex];
+      previewText.setText(model ? theme.fg("muted", `Model Name: ${model.name}`) : "");
+    }
+
+    function filterModels(query: string) {
+      filteredModels = query
+        ? fuzzyFilter(sortedModels, query, (m) => `${m.id} ${m.provider} ${m.name}`)
+        : sortedModels;
+      selectedIndex = Math.min(selectedIndex, Math.max(0, filteredModels.length - 1));
+      updateList();
+      updatePreview();
+    }
+
+    searchInput.onSubmit = () => {
+      if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
+    };
+
+    const container = new Container();
+    container.addChild(border);
+    container.addChild(new Spacer(1));
+    container.addChild(new Text(theme.fg("accent", title), 1, 0));
+    container.addChild(new Spacer(1));
+    container.addChild(searchInput);
+    container.addChild(new Spacer(1));
+    container.addChild(listContainer);
+    container.addChild(new Spacer(1));
+    container.addChild(previewText);
+    container.addChild(new Spacer(1));
+    container.addChild(border);
+
+    updateList();
+    updatePreview();
+
+    return {
+      render(width: number) { return container.render(width); },
+      invalidate() { container.invalidate(); },
+      handleInput(data: string) {
+        if (kb.matches(data, "tui.select.up")) {
+          if (filteredModels.length === 0) return;
+          selectedIndex = selectedIndex === 0 ? filteredModels.length - 1 : selectedIndex - 1;
+          updateList();
+          updatePreview();
+        } else if (kb.matches(data, "tui.select.down")) {
+          if (filteredModels.length === 0) return;
+          selectedIndex = selectedIndex === filteredModels.length - 1 ? 0 : selectedIndex + 1;
+          updateList();
+          updatePreview();
+        } else if (kb.matches(data, "tui.select.confirm")) {
+          if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
+        } else if (kb.matches(data, "tui.select.cancel")) {
+          done(undefined);
+        } else {
+          searchInput.handleInput(data);
+          filterModels(searchInput.getValue());
+        }
+        tui.requestRender();
+      },
+    };
+  });
+}
+
 export default function piImageGen(pi: ExtensionAPI) {
   let sessionSelection: ModelSelection | null = null;
+  let editModelSelection: ModelSelection | null = null;
 
   // ── Image cost accounting ──
   // Cumulative image spend for this session, surfaced as a footer status chip.
@@ -882,6 +1194,20 @@ export default function piImageGen(pi: ExtensionAPI) {
       const config = loadConfig(ctx.cwd);
       if (config.defaultProvider && config.defaultModel) {
         sessionSelection = { provider: config.defaultProvider, model: config.defaultModel };
+      }
+    }
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === "custom" && entry.customType === SESSION_ENTRY_EDIT_TYPE) {
+        const data = entry.data as ModelSelection | undefined;
+        if (data?.provider && data?.model) {
+          editModelSelection = data;
+        }
+      }
+    }
+    if (!editModelSelection) {
+      const config = loadConfig(ctx.cwd);
+      if (config.defaultEditProvider && config.defaultEditModel) {
+        editModelSelection = { provider: config.defaultEditProvider, model: config.defaultEditModel };
       }
     }
 
@@ -953,122 +1279,7 @@ export default function piImageGen(pi: ExtensionAPI) {
 
       // Interactive selection with search — mirrors Pi's /model UI
       const currentKey = sessionSelection ? `${sessionSelection.provider}/${sessionSelection.model}` : null;
-
-      // Sort: current model first, then alphabetically by provider
-      const sortedModels = [...allModels].sort((a, b) => {
-        const aIsCurrent = `${a.provider}/${a.id}` === currentKey;
-        const bIsCurrent = `${b.provider}/${b.id}` === currentKey;
-        if (aIsCurrent && !bIsCurrent) return -1;
-        if (!aIsCurrent && bIsCurrent) return 1;
-        return a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
-      });
-
-      const selected = await ctx.ui.custom<ImageModel | undefined>((tui, theme, kb, done) => {
-        const searchInput = new Input();
-        searchInput.focused = true;
-        const listContainer = new Container();
-        const previewText = new Text("", 1, 0);
-        let filteredModels = sortedModels;
-        let selectedIndex = 0;
-
-        // Thin border that spans viewport width, matching Pi's DynamicBorder
-        const border = { render: (w: number) => [theme.fg("border", "─".repeat(Math.max(1, w)))], invalidate() {} };
-
-        function updateList() {
-          listContainer.clear();
-          const maxVisible = 10;
-          const startIndex = Math.max(
-            0,
-            Math.min(selectedIndex - Math.floor(maxVisible / 2), filteredModels.length - maxVisible),
-          );
-          const endIndex = Math.min(startIndex + maxVisible, filteredModels.length);
-
-          for (let i = startIndex; i < endIndex; i++) {
-            const item = filteredModels[i];
-            if (!item) continue;
-            const isHighlighted = i === selectedIndex;
-            const isCurrent = `${item.provider}/${item.id}` === currentKey;
-            const providerBadge = theme.fg("muted", ` [${item.provider}]`);
-            const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-
-            const line = isHighlighted
-              ? `${theme.fg("accent", "→ ")}${theme.fg("accent", item.id)}${providerBadge}${checkmark}`
-              : `  ${item.id}${providerBadge}${checkmark}`;
-            listContainer.addChild(new Text(line, 0, 0));
-          }
-
-          if (filteredModels.length > maxVisible) {
-            listContainer.addChild(
-              new Text(theme.fg("muted", `  (${selectedIndex + 1}/${filteredModels.length})`), 0, 0),
-            );
-          }
-
-          if (filteredModels.length === 0) {
-            listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
-          }
-        }
-
-        function updatePreview() {
-          const model = filteredModels[selectedIndex];
-          previewText.setText(model ? theme.fg("muted", `Model Name: ${model.name}`) : "");
-        }
-
-        function filterModels(query: string) {
-          filteredModels = query
-            ? fuzzyFilter(sortedModels, query, (m) => `${m.id} ${m.provider} ${m.name}`)
-            : sortedModels;
-          selectedIndex = Math.min(selectedIndex, Math.max(0, filteredModels.length - 1));
-          updateList();
-          updatePreview();
-        }
-
-        searchInput.onSubmit = () => {
-          if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
-        };
-
-        const container = new Container();
-        container.addChild(border);
-        container.addChild(new Spacer(1));
-        container.addChild(new Text(theme.fg("accent", "Select image model"), 1, 0));
-        container.addChild(new Spacer(1));
-        container.addChild(searchInput);
-        container.addChild(new Spacer(1));
-        container.addChild(listContainer);
-        container.addChild(new Spacer(1));
-        container.addChild(previewText);
-        container.addChild(new Spacer(1));
-        container.addChild(border);
-
-        updateList();
-        updatePreview();
-
-        return {
-          render(width: number) { return container.render(width); },
-          invalidate() { container.invalidate(); },
-          handleInput(data: string) {
-            if (kb.matches(data, "tui.select.up")) {
-              if (filteredModels.length === 0) return;
-              selectedIndex = selectedIndex === 0 ? filteredModels.length - 1 : selectedIndex - 1;
-              updateList();
-              updatePreview();
-            } else if (kb.matches(data, "tui.select.down")) {
-              if (filteredModels.length === 0) return;
-              selectedIndex = selectedIndex === filteredModels.length - 1 ? 0 : selectedIndex + 1;
-              updateList();
-              updatePreview();
-            } else if (kb.matches(data, "tui.select.confirm")) {
-              if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
-            } else if (kb.matches(data, "tui.select.cancel")) {
-              done(undefined);
-            } else {
-              searchInput.handleInput(data);
-              filterModels(searchInput.getValue());
-            }
-            tui.requestRender();
-          },
-        };
-      });
-
+      const selected = await pickModelWithUI(ctx, allModels, currentKey, "Select image model");
       if (!selected) return;
 
       sessionSelection = { provider: selected.provider, model: selected.id };
@@ -1079,13 +1290,91 @@ export default function piImageGen(pi: ExtensionAPI) {
     },
   });
 
+  // ── /image-edit-model command ──
+
+  pi.registerCommand("image-edit-model", {
+    description: "Select the default image edit model (accepts an input image)",
+
+    getArgumentCompletions(prefix: string) {
+      const config = loadConfig(process.cwd());
+      const models = listInputImageModels(config);
+      return models
+        .map((m) => `${m.provider}/${m.id}`)
+        .filter((label) => label.startsWith(prefix))
+        .map((label) => {
+          const model = models.find((m) => `${m.provider}/${m.id}` === label)!;
+          return { value: label, label: `${model.name} (${model.provider})` };
+        });
+    },
+
+    async handler(args: string, ctx) {
+      const config = loadConfig(ctx.cwd);
+      const allModels = listInputImageModels(config);
+
+      if (allModels.length === 0) {
+        ctx.ui.notify(
+          "No image models that accept an input image were found. Check your connection (capabilities are discovered from OpenRouter) or add edit-capable models to settings/providers.",
+          "error",
+        );
+        return;
+      }
+
+      // Direct selection: /image-edit-model openai/gpt-image-1
+      if (args.trim()) {
+        const input = args.trim();
+        const slashIdx = input.indexOf("/");
+        let found: ImageModel | undefined;
+        if (slashIdx > 0) {
+          const provider = input.slice(0, slashIdx);
+          const modelId = input.slice(slashIdx + 1);
+          found = allModels.find((m) => m.provider === provider && m.id === modelId);
+          if (!found) {
+            found = allModels.find((m) => m.id === input);
+          }
+        } else {
+          found = allModels.find((m) => m.id === input);
+        }
+
+        if (!found) {
+          ctx.ui.notify(
+            `Unknown edit-capable image model "${input}". Run /image-edit-model to see options.`,
+            "error",
+          );
+          return;
+        }
+
+        editModelSelection = { provider: found.provider, model: found.id };
+        pi.appendEntry(SESSION_ENTRY_EDIT_TYPE, editModelSelection);
+        await saveDefaultEditModel(found.provider, found.id);
+        ctx.ui.notify(`Image edit model: ${found.name} (${found.provider}/${found.id})`, "info");
+        return;
+      }
+
+      // Interactive selection — only models that accept input images
+      const currentKey = editModelSelection ? `${editModelSelection.provider}/${editModelSelection.model}` : null;
+      const selected = await pickModelWithUI(
+        ctx,
+        allModels,
+        currentKey,
+        "Select image edit model (accepts input images)",
+      );
+      if (!selected) return;
+
+      editModelSelection = { provider: selected.provider, model: selected.id };
+      pi.appendEntry(SESSION_ENTRY_EDIT_TYPE, editModelSelection);
+      await saveDefaultEditModel(selected.provider, selected.id);
+      ctx.ui.notify(`Image edit model: ${selected.name} (${selected.provider}/${selected.id})`, "info");
+    },
+  });
+
   // ── generate_image tool ──
 
   pi.registerTool({
     name: "generate_image",
     label: "Generate image",
     description:
-      "Generate an image from a text prompt. Uses the model selected via /image-model. " +
+      "Generate an image from a text prompt, or edit an existing image when inputImage is provided. " +
+      "Uses the model selected via /image-model (or the edit-capable model from /image-edit-model when editing). " +
       "Do NOT pass provider or model parameters — just provide the prompt.",
     parameters: TOOL_PARAMS,
 
@@ -1097,7 +1386,11 @@ export default function piImageGen(pi: ExtensionAPI) {
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
       const config = loadConfig(ctx.cwd);
-      const imageModel = resolveModel(sessionSelection, config);
+      const inputImages = params.inputImage ? [loadInputImageDataUrl(params.inputImage, ctx.cwd)] : undefined;
+      const generationModel = resolveModel(sessionSelection, config);
+      const imageModel = inputImages
+        ? resolveEditModel(editModelSelection, config, generationModel)
+        : generationModel;
       const aspectRatio = params.aspectRatio || "1:1";
       const imageSize = params.imageSize || "1K";
       const quality = params.quality || "auto";
@@ -1110,12 +1403,12 @@ export default function piImageGen(pi: ExtensionAPI) {
         : timeoutSignal;
 
       onUpdate?.({
-        content: [{ type: "text", text: `Generating image with ${imageModel.provider}/${imageModel.id}...` }],
-        details: { provider: imageModel.provider, model: imageModel.id, api: imageModel.api },
+        content: [{ type: "text", text: `${inputImages ? "Editing image with" : "Generating image with"} ${imageModel.provider}/${imageModel.id}...` }],
+        details: { provider: imageModel.provider, model: imageModel.id, api: imageModel.api, editing: !!inputImages },
       });
 
       const providerConfig = await resolveProviderConfig(imageModel, ctx, config);
-      const image = await generateImage(providerConfig, imageModel, params.prompt, aspectRatio, imageSize, quality, combinedSignal);
+      const image = await generateImage(providerConfig, imageModel, params.prompt, aspectRatio, imageSize, quality, combinedSignal, inputImages);
 
       // Record spend: footer cost total + /session breakdown + footer image-cost chip
       const billedCost = recordImageUsage(ctx, imageModel, image);
@@ -1133,7 +1426,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       }
 
       const summary: string[] = [
-        `Generated image.`,
+        inputImages ? `Edited image using ${params.inputImage}.` : `Generated image.`,
         `Aspect ratio: ${aspectRatio}.`,
       ];
       if (savedPath) summary.push(`Saved to: ${savedPath}`);
@@ -1149,6 +1442,7 @@ export default function piImageGen(pi: ExtensionAPI) {
           provider: imageModel.provider,
           model: imageModel.id,
           api: imageModel.api,
+          inputImage: params.inputImage,
           aspectRatio,
           quality,
           savedPath,
